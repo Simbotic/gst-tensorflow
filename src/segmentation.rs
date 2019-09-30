@@ -1,6 +1,7 @@
 use glib;
 use glib::subclass;
 use glib::subclass::prelude::*;
+
 use gst;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
@@ -8,29 +9,23 @@ use gst_base;
 use gst_base::subclass::prelude::*;
 use gst_video;
 
-// use tensorflow::Code;
-use tensorflow::Graph;
-use tensorflow::ImportGraphDefOptions;
-use tensorflow::Session;
-use tensorflow::SessionOptions;
-use tensorflow::SessionRunArgs;
-// use tensorflow::Status;
-use tensorflow::Tensor;
-// use tensorflow::SavedModelBundle;
-
-// use tensorflow_sys as tf;
-
-use std::error::Error;
-use std::fs::File;
-use std::io::Read;
-// use std::path::Path;
-// use std::process::exit;
 use std::result::Result;
-
 use std::i32;
 use std::sync::Mutex;
 
-use rand::Rng;
+use opencv::{
+    objdetect,
+    prelude::*,
+    core::{
+        Rect,
+        Scalar
+    },
+    imgproc,
+    types::VectorOfPoint,
+};
+
+use std::mem::transmute;
+
 
 #[cfg_attr(feature = "examples_system_alloc", global_allocator)]
 #[cfg(feature = "examples_system_alloc")]
@@ -90,35 +85,24 @@ struct State {
 struct Segmentation {
     cat: gst::DebugCategory,
     settings: Mutex<Settings>,
-    state: Mutex<Option<State>>,
-    tf_graph: Mutex<Option<Graph>>,
-    tf_session: Mutex<Option<Session>>,
-    color_map: Vec<[u8; 3]>,
+    state: Mutex<Option<State>>
 }
 
 impl Segmentation {
+    // fn DrawLines(Img: &mut Mat, BBox: &Mat) {
+        // let nrows: i32 = BBox.rows().unwrap();
+        // let lines_color = core::Scalar::new(255.0, 0.0, 0.0, 1.0);
 
-    fn load_tf() -> Result<(Graph, Session), Box<dyn Error>> {
-
-        // let filename = "deeplabv3_pascal_trainval_2018_01_04/deeplabv3_pascal_trainval/frozen_inference_graph.pb";
-        let filename = "models/deeplabv3_mnv2_pascal_train_aug_2018_01_29/deeplabv3_mnv2_pascal_train_aug/frozen_inference_graph.pb";
-        let mut graph = Graph::new();
-        let mut proto = Vec::new();
-        File::open(filename)?.read_to_end(&mut proto)?;
-        graph.import_graph_def(&proto, &ImportGraphDefOptions::new())?;
-        let session = Session::new(&SessionOptions::new(), &graph)?;
-
-        // let ops = graph.operation_iter().filter_map(|op: tensorflow::Operation| {
+        // for index in 0..nrows {
+        //     let p1_a: f32 = BBox.at_2d<float>(index, 0).unwrap();
             
-        //     Some(op.op_type().unwrap())
-        // }).collect::<String>();
-        // println!("{:?}", ops);
+        //     let p1 = Point2i::new(p1_a, BBox.at_2d(index, 1));
+        //     let p2 = Point2i::new(BBox.at_2d((index + 1) % nrows, 0), BBox.at_2d((index + 1) % nrows, 1));
 
-        // assert!((1==0));
+        //     imgproc::line(Img, p1, p2, lines_color, 3, 8, 0);
+        // }
 
-        Ok((graph, session))
-    }
-
+    // }
 }
 
 // This trait registers our type with the GObject object system and
@@ -136,12 +120,6 @@ impl ObjectSubclass for Segmentation {
     // Called when a new instance is to be created. We need to return an instance
     // of our struct here.
     fn new() -> Self {
-        let mut rng = rand::thread_rng();
-        let (graph, session) = Segmentation::load_tf().unwrap();
-        let mut color_map = Vec::with_capacity(256);
-        for _ in 0 .. 256 {
-            color_map.push([rng.gen(), rng.gen(), rng.gen()]);
-        }
         Self {
             cat: gst::DebugCategory::new(
                 "tf_segmentation",
@@ -149,10 +127,7 @@ impl ObjectSubclass for Segmentation {
                 Some("video to depth inference"),
             ),
             settings: Mutex::new(Default::default()),
-            state: Mutex::new(None),
-            tf_graph: Mutex::new(Some(graph)),
-            tf_session: Mutex::new(Some(session)),
-            color_map: color_map,
+            state: Mutex::new(None)
         }
     }
 
@@ -276,7 +251,7 @@ impl ObjectImpl for Segmentation {
         match *prop {
             subclass::Property("invert", ..) => {
                 let mut settings = self.settings.lock().unwrap();
-                let invert = value.get().unwrap();
+                let invert = value.get_some().unwrap();
                 gst_info!(
                     self.cat,
                     obj: element,
@@ -288,7 +263,7 @@ impl ObjectImpl for Segmentation {
             }
             subclass::Property("shift", ..) => {
                 let mut settings = self.settings.lock().unwrap();
-                let shift = value.get().unwrap();
+                let shift = value.get_some().unwrap();
                 gst_info!(
                     self.cat,
                     obj: element,
@@ -501,16 +476,11 @@ impl BaseTransformImpl for Segmentation {
         let in_data = in_frame.plane_data(0).unwrap();
         let out_stride = out_frame.plane_stride()[0] as usize;
         let out_format = out_frame.format();
+        let out_width = out_frame.width() as i32;
+        let out_height = out_frame.height() as i32;
         let out_data = out_frame.plane_data_mut(0).unwrap();
 
-        // First check the output format. Our input format is always Rgb but the output might
-        // be Rgb or Gray8. Based on what it is we need to do processing slightly differently.
         if out_format == gst_video::VideoFormat::Rgb {
-            // Some assertions about our assumptions how the data looks like. This is only there
-            // to give some further information to the compiler, in case these can be used for
-            // better optimizations of the resulting code.
-            //
-            // If any of the assertions were not true, the code below would fail cleanly.
             assert_eq!(in_data.len() % 3, 0);
             assert_eq!(out_data.len() % 3, 0);
             assert_eq!(out_data.len() / out_stride, in_data.len() / in_stride);
@@ -520,80 +490,42 @@ impl BaseTransformImpl for Segmentation {
 
             assert!(in_line_bytes <= in_stride);
             assert!(out_line_bytes <= out_stride);
+
+            let mut mut_in_data = in_data.to_vec();
+
+            let mut src = Mat::new_rows_cols_with_data(
+                    out_height,
+                    out_width,
+                    opencv::core::CV_8UC3,
+                    unsafe { transmute(mut_in_data.as_mut_ptr()) },
+                    in_stride
+                )
+                .unwrap();
+
+
+            let mut detector = objdetect::QRCodeDetector::default().unwrap();
+            let mut pts = VectorOfPoint::new();
+            let mut straight = Mat::default().unwrap();
+            let decoded_data = detector.detect_and_decode(&src, &mut pts, &mut straight).unwrap();
+
+            if !straight.empty().unwrap() {
+                let p_to_slice = pts.to_slice();
+                let qr_rect = Rect::from_points(p_to_slice[0], p_to_slice[2]);
+                let rect_color = Scalar::new(255., 0., 0., 1.);
+
+                imgproc::rectangle(&mut src, qr_rect, rect_color, 2, 8, 0).unwrap();
+
+                // println!("{:?} - Decoded Data: {}", p_to_slice, decoded_data);
+            }
             
-            let mut session_guard = self.tf_session.lock().unwrap();
-            let session = session_guard.as_mut().unwrap();
-            
-            let mut graph_guard = self.tf_graph.lock().unwrap();
-            let graph = graph_guard.as_mut().unwrap();
+            let src = src.reshape(1, 1).unwrap();
 
-            // let session = Session::new(&SessionOptions::new(), &graph).unwrap();
-
-            let tensor_in = graph.operation_by_name_required("ImageTensor").unwrap();
-            let tensor_out = graph.operation_by_name_required("SemanticPredictions").unwrap();
-            let tensor_image_in = Tensor::new(&[1, 512, 288, 3]).with_values(in_data).unwrap();
-
-            println!("tensor_in num_inputs: {} num_outputs: {} type: {}", tensor_in.num_inputs(), tensor_in.num_outputs(), tensor_in.output_type(0));
-
-            let mut step = SessionRunArgs::new();
-            step.add_feed(&tensor_in, 0, &tensor_image_in);
-            let seg_out = step.request_fetch(&tensor_out, 0);
-            session.run(&mut step).unwrap();
-
-            let tensor_segmentation : tensorflow::Tensor<i64> = step.fetch(seg_out).unwrap();
-            
-            let segmentation = tensor_segmentation.to_vec();
-            println!("out tensor length: {} dim: {:?}", segmentation.len(), tensor_segmentation.dims());
-            // println!("SEGMENTATION: {:?}", &segmentation);
-            // println!("SEGMENTATION: {:?}", &tensor_segmentation);
-            for i in 0 .. segmentation.len() {
-                let c = self.color_map[segmentation[i] as usize];
-                out_data[i*3+0] = c[0];
-                out_data[i*3+1] = c[1];
-                out_data[i*3+2] = c[2];
+            for i in 0 .. src.size().unwrap().width {
+                out_data[i as usize] = *src.at::<u8>(i).unwrap();
             }
 
-            // let same_image = tensor_image_in.to_vec();
-            // for i in 0 .. out_data.len() {
-            //     out_data[i] = same_image[i];
-            // }
-
         } else if out_format == gst_video::VideoFormat::Gray8 {
-            assert_eq!(in_data.len() % 4, 0);
-            assert_eq!(out_data.len() / out_stride, in_data.len() / in_stride);
-
-            let in_line_bytes = width * 4;
-            let out_line_bytes = width;
-
-            assert!(in_line_bytes <= in_stride);
-            assert!(out_line_bytes <= out_stride);
-
-            // Iterate over each line of the input and output frame, mutable for the output frame.
-            // Each input line has in_stride bytes, each output line out_stride. We use the
-            // chunks_exact/chunks_exact_mut iterators here for getting a chunks of that many bytes per
-            // iteration and zip them together to have access to both at the same time.
-            // for (in_line, out_line) in in_data
-            //     .chunks_exact(in_stride)
-            //     .zip(out_data.chunks_exact_mut(out_stride))
-            // {
-                // Next iterate the same way over each actual pixel in each line. Every pixel is 4
-                // bytes in the input and 1 byte in the output, so we again use the
-                // chunks_exact/chunks_exact_mut iterators to give us each pixel individually and zip them
-                // together.
-                //
-                // Note that we take a sub-slice of the whole lines: each line can contain an
-                // arbitrary amount of padding at the end (e.g. for alignment purposes) and we
-                // don't want to process that padding.
-                // for (in_p, out_p) in in_line[..in_line_bytes]
-                //     .chunks_exact(4)
-                //     .zip(out_line[..out_line_bytes].iter_mut())
-                // {
-                    // Use our above-defined function to convert a BGRx pixel with the settings to
-                    // a grayscale value. Then store the value in the grayscale output directly.
-                    // let gray = Segmentation::bgrx_to_gray(in_p, settings.shift as u8, settings.invert);
-                    // *out_p = gray;
-                // }
-            // }
+            unimplemented!();
         } else {
             unimplemented!();
         }

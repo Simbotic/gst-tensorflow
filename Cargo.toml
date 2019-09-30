@@ -9,14 +9,15 @@ description = "Tensorflow GStreamer Plugin"
 
 [dependencies]
 rand = "0.7"
-glib = { git = "https://github.com/gtk-rs/glib", features = ["subclassing"] }
-gstreamer = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", features = ["subclassing"] }
-gstreamer-base = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", features = ["subclassing"] }
+glib = { git = "https://github.com/gtk-rs/glib" }
+gstreamer = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs" }
+gstreamer-base = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs" }
 gstreamer-video = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs" }
 gstreamer-audio = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs" }
 byte-slice-cast = "0.3"
 num-traits = "0.2"
 tensorflow = { version = "0.13.0", features = ["tensorflow_gpu"] }
+opencv = {version = "0.23", default-features = false, features = ["opencv-41"]}
 
 [lib]
 name = "gsttensorflow"
