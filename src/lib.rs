@@ -17,6 +17,7 @@ extern crate rand;
 mod rgb2gray;
 mod vid2depth;
 mod segmentation;
+mod qrcode_detection;
 
 // Plugin entry point that should register all elements provided by this plugin,
 // and everything else that this plugin might provide (e.g. typefinders or device providers).
@@ -24,6 +25,7 @@ fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     rgb2gray::register(plugin)?;
     vid2depth::register(plugin)?;
     segmentation::register(plugin)?;
+    qrcode_detection::register(plugin)?;
     Ok(())
 }
 
